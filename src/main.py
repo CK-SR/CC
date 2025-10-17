@@ -4,7 +4,7 @@ import cv2
 import numpy as np
 import asyncio
 import concurrent.futures
-from typing import Dict, Set, Optional
+from typing import Dict, Set, Optional, Any
 import redis
 from fastapi import FastAPI, APIRouter, WebSocket, WebSocketDisconnect, Body
 from fastapi.responses import JSONResponse
@@ -28,7 +28,11 @@ EXECUTOR_CPU = concurrent.futures.ThreadPoolExecutor(
 
 EXECUTOR_IO = concurrent.futures.ThreadPoolExecutor(max_workers=64)
 
-app = FastAPI(title="PushHub", version="1.0")
+app = FastAPI(
+    title="PushHub",
+    description="Camera analysis service / 摄像头分析服务",
+    version="1.0",
+)
 
 # 定义 Router
 router = APIRouter(prefix="/pushhub", tags=["PushHub"])
@@ -99,6 +103,49 @@ MINIO_JPEG_Q     = int(os.getenv("MINIO_JPEG_QUALITY", "85"))
 
 MINIO_CLIENT: Minio | None = None
 LAST_MINIO_SAVE_TS: Dict[str, float] = {}  # 每路上次保存时间（sample 用）
+
+
+MESSAGE_I18N = {
+    "Service already started": "服务已经启动",
+    "Service started": "服务已启动",
+    "Service already stopped": "服务已经停止",
+    "Service stopped and resources released": "服务已停止并释放资源",
+    "Service not started": "服务尚未启动",
+    "streams must be a list": "streams 参数必须是列表",
+    "Subscribe succeeded": "订阅成功",
+    "Decoding failed": "解码失败",
+}
+
+STATE_I18N = {
+    "Error": "错误",
+    "Black Screen": "黑屏",
+    "Occluded": "画面遮挡",
+    "Tampered (Violent Motion)": "疑似破坏（剧烈运动）",
+    "Normal": "正常",
+}
+
+
+def _with_message_i18n(payload: Dict[str, Any], key: str, target_key: str = "msg") -> Dict[str, Any]:
+    """为响应 payload 增加中文翻译字段。"""
+
+    translated = MESSAGE_I18N.get(key, key)
+    payload[target_key] = key
+    payload[f"{target_key}_zh"] = translated
+    return payload
+
+
+def _apply_analysis_i18n(result: dict) -> dict:
+    """为分析结果补充中文描述。"""
+
+    state = result.get("state")
+    if state:
+        result["state_zh"] = STATE_I18N.get(state, state)
+
+    error_msg = result.get("error")
+    if error_msg:
+        result["error_zh"] = MESSAGE_I18N.get(error_msg, error_msg)
+
+    return result
 
 # ★ 安全文件名生成器
 def safe_filename(stream_name: str) -> str:
@@ -242,12 +289,15 @@ def _decode_and_analyze_frame(
         decode_ms = round((t1 - t0) * 1000, 3)
 
         if grey is None:
-            return ({"state": "Error", "error": "Decoding failed", "decode_ms": decode_ms}, prev_frame)
+            return (
+                _apply_analysis_i18n({"state": "Error", "error": "Decoding failed", "decode_ms": decode_ms}),
+                prev_frame,
+            )
 
         # 1. 黑屏
         mean_intensity = float(grey.mean())
         if mean_intensity < float(current_threshold):
-            return ({"state": "Black Screen", "decode_ms": decode_ms}, grey)
+            return (_apply_analysis_i18n({"state": "Black Screen", "decode_ms": decode_ms}), grey)
 
         # 2. 遮挡
         low_threshold = int(edge_params["low"])
@@ -255,7 +305,16 @@ def _decode_and_analyze_frame(
         edges = cv2.Canny(grey, low_threshold, high_threshold)
         edge_ratio = float(cv2.countNonZero(edges)) / float(grey.size)
         if edge_ratio < float(edge_params["min_ratio"]):
-            return ({"state": "Occluded", "edge_ratio": round(edge_ratio * 100.0, 2), "decode_ms": decode_ms}, grey)
+            return (
+                _apply_analysis_i18n(
+                    {
+                        "state": "Occluded",
+                        "edge_ratio": round(edge_ratio * 100.0, 2),
+                        "decode_ms": decode_ms,
+                    }
+                ),
+                grey,
+            )
 
         # 3. 恶意破坏
         if prev_frame is not None and prev_frame.shape == grey.shape:
@@ -286,25 +345,33 @@ def _decode_and_analyze_frame(
                 )
             ):
                 return (
-                    {
-                        "state": "Tampered (Violent Motion)",
-                        "diff_mean": round(diff_mean, 2),
-                        "high_diff_ratio": round(high_diff_ratio, 2),
-                        "roi_ratio": round(roi_ratio, 2),
-                        "decode_ms": decode_ms,
-                    },
+                    _apply_analysis_i18n(
+                        {
+                            "state": "Tampered (Violent Motion)",
+                            "diff_mean": round(diff_mean, 2),
+                            "high_diff_ratio": round(high_diff_ratio, 2),
+                            "roi_ratio": round(roi_ratio, 2),
+                            "decode_ms": decode_ms,
+                        }
+                    ),
                     grey,
                 )
 
         # 4. 正常
         return (
-            {"state": "Normal", "edge_ratio": round(edge_ratio * 100.0, 2), "decode_ms": decode_ms},
+            _apply_analysis_i18n(
+                {
+                    "state": "Normal",
+                    "edge_ratio": round(edge_ratio * 100.0, 2),
+                    "decode_ms": decode_ms,
+                }
+            ),
             grey,
         )
 
     except Exception as e:
         print(f"[analyze][error] {e}")
-        return ({"state": "Error", "error": str(e), "decode_ms": 0.0}, prev_frame)
+        return (_apply_analysis_i18n({"state": "Error", "error": str(e), "decode_ms": 0.0}), prev_frame)
 
 
 # ★★★ 替换 analyze_frame_async 返回类型 ★★★
@@ -498,10 +565,10 @@ async def start_service():
     global SERVICE_ACTIVE
     if SERVICE_ACTIVE:
         print("[service] start called, but already active")
-        return {"ok": True, "msg": "Service already started"}
+        return _with_message_i18n({"ok": True}, "Service already started")
     SERVICE_ACTIVE = True
     print("[service] started")
-    return {"ok": True, "msg": "Service started"}
+    return _with_message_i18n({"ok": True}, "Service started")
 
 
 @router.post("/stop")
@@ -509,7 +576,7 @@ async def stop_service():
     global SERVICE_ACTIVE, STREAM_WORKERS, SUBSCRIBED_STREAMS, PREV_FRAMES
     if not SERVICE_ACTIVE:
         print("[service] stop called, but already inactive")
-        return {"ok": True, "msg": "Service already stopped"}
+        return _with_message_i18n({"ok": True}, "Service already stopped")
 
     SERVICE_ACTIVE = False
     print("[service] stopping workers...")
@@ -520,7 +587,7 @@ async def stop_service():
     SUBSCRIBED_STREAMS.clear()
     PREV_FRAMES.clear()
     print("[service] stopped, resources released")
-    return {"ok": True, "msg": "Service stopped and resources released"}
+    return _with_message_i18n({"ok": True}, "Service stopped and resources released")
 
 
 @router.post("/subscribe")
@@ -529,11 +596,13 @@ async def subscribe(body: Dict = Body(...)):
 
     if not SERVICE_ACTIVE:
         print("[subscribe] rejected, service not started")
-        return JSONResponse({"ok": False, "error": "Service not started"}, status_code=400)
+        data = _with_message_i18n({"ok": False}, "Service not started", target_key="error")
+        return JSONResponse(data, status_code=400)
 
     streams = body.get("streams", [])
     if not isinstance(streams, list):
-        return JSONResponse({"ok": False, "error": "streams must be a list"}, status_code=400)
+        data = _with_message_i18n({"ok": False}, "streams must be a list", target_key="error")
+        return JSONResponse(data, status_code=400)
 
     CURRENT_THRESHOLD = int(body.get("current_threshold", settings.DEFAULT_CURRENT_THRESHOLD))
     EDGE_PARAMS.update({k: v for k, v in body.get("edge_params", {}).items() if k in EDGE_PARAMS})
@@ -552,7 +621,8 @@ async def subscribe(body: Dict = Body(...)):
 
     print(f"[subscribe] epoch={curr_epoch}, subscribed={list(SUBSCRIBED_STREAMS)}")
     print(f"[params] current_threshold={CURRENT_THRESHOLD}, edge_params={EDGE_PARAMS}, tamper_params={TAMPER_PARAMS}")
-    return {"ok": True, "epoch": curr_epoch, "subscribed": list(SUBSCRIBED_STREAMS)}
+    response = {"ok": True, "epoch": curr_epoch, "subscribed": list(SUBSCRIBED_STREAMS)}
+    return _with_message_i18n(response, "Subscribe succeeded")
 
 
 @router.websocket("/ws/results")
