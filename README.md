@@ -1,5 +1,7 @@
 # Camera Check Service
 
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 This repository contains a FastAPI based service that analyses camera frames for
 common issues such as black screens, occlusions and tampering. Frames are pulled
 from Redis streams, processed asynchronously and optional snapshots are stored
