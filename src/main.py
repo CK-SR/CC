@@ -237,53 +237,70 @@ def _decode_and_analyze_frame(
     try:
         t0 = time.monotonic()
         nparr = np.frombuffer(jpeg_bytes, np.uint8)
-        frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        grey = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
         t1 = time.monotonic()
         decode_ms = round((t1 - t0) * 1000, 3)
 
-        if frame is None:
+        if grey is None:
             return ({"state": "Error", "error": "Decoding failed", "decode_ms": decode_ms}, prev_frame)
 
-        grey = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
         # 1. 黑屏
-        if float(grey.mean()) < float(current_threshold):
+        mean_intensity = float(grey.mean())
+        if mean_intensity < float(current_threshold):
             return ({"state": "Black Screen", "decode_ms": decode_ms}, grey)
 
         # 2. 遮挡
-        edges = cv2.Canny(grey, int(edge_params["low"]), int(edge_params["high"]))
+        low_threshold = int(edge_params["low"])
+        high_threshold = int(edge_params["high"])
+        edges = cv2.Canny(grey, low_threshold, high_threshold)
         edge_ratio = float(cv2.countNonZero(edges)) / float(grey.size)
         if edge_ratio < float(edge_params["min_ratio"]):
             return ({"state": "Occluded", "edge_ratio": round(edge_ratio * 100.0, 2), "decode_ms": decode_ms}, grey)
 
         # 3. 恶意破坏
-        if prev_frame is not None:
+        if prev_frame is not None and prev_frame.shape == grey.shape:
             diff = cv2.absdiff(grey, prev_frame)
             diff_blur = cv2.GaussianBlur(diff, (5, 5), 0)
+
+            diff_threshold = float(tamper_params["diff_threshold"])
+            high_ratio_threshold = float(tamper_params["high_ratio"])
+            roi_diff_threshold = float(tamper_params["roi_diff_threshold"])
+
+            diff_mean = float(diff_blur.mean())
+            high_diff_ratio = float(np.count_nonzero(diff_blur > 25)) / float(diff_blur.size)
+
             h, w = diff_blur.shape
             grid_h, grid_w = h // 3, w // 3
-            roi_changes = 0
-            for i in range(3):
-                for j in range(3):
-                    roi = diff_blur[i*grid_h:(i+1)*grid_h, j*grid_w:(j+1)*grid_w]
-                    if roi.mean() > float(tamper_params["roi_diff_threshold"]):
-                        roi_changes += 1
-            roi_ratio = roi_changes / 9.0
-            diff_mean = float(diff_blur.mean())
-            high_diff_ratio = float(np.sum(diff_blur > 25)) / float(diff_blur.size)
+            roi_ratio = 0.0
+            if grid_h and grid_w:
+                trimmed = diff_blur[: grid_h * 3, : grid_w * 3]
+                blocks = trimmed.reshape(3, grid_h, 3, grid_w)
+                block_means = blocks.mean(axis=(1, 3))
+                roi_ratio = float(np.count_nonzero(block_means > roi_diff_threshold)) / block_means.size
 
-            if (diff_mean > float(tamper_params["diff_threshold"]) and
-                (high_diff_ratio > float(tamper_params["high_ratio"]) or roi_ratio > 0.5)):
-                return ({
-                    "state": "Tampered (Violent Motion)",
-                    "diff_mean": round(diff_mean, 2),
-                    "high_diff_ratio": round(high_diff_ratio, 2),
-                    "roi_ratio": round(roi_ratio, 2),
-                    "decode_ms": decode_ms
-                }, grey)
+            if (
+                diff_mean > diff_threshold
+                and (
+                    high_diff_ratio > high_ratio_threshold
+                    or roi_ratio > 0.5
+                )
+            ):
+                return (
+                    {
+                        "state": "Tampered (Violent Motion)",
+                        "diff_mean": round(diff_mean, 2),
+                        "high_diff_ratio": round(high_diff_ratio, 2),
+                        "roi_ratio": round(roi_ratio, 2),
+                        "decode_ms": decode_ms,
+                    },
+                    grey,
+                )
 
         # 4. 正常
-        return ({"state": "Normal", "edge_ratio": round(edge_ratio * 100.0, 2), "decode_ms": decode_ms}, grey)
+        return (
+            {"state": "Normal", "edge_ratio": round(edge_ratio * 100.0, 2), "decode_ms": decode_ms},
+            grey,
+        )
 
     except Exception as e:
         print(f"[analyze][error] {e}")
